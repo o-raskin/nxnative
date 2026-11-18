@@ -166,7 +166,13 @@ void dm_host_preload_start(int argc, char **argv) {
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);
     if (pthread_create(&g_pre.th, &a, preload_thread, NULL)) die("dm_host_preload_start: cannot start the thread");
 }
+#if __has_include("presets.inc")
+#include "presets.inc"   // the profile's graphics presets (DM_AC_PRESET), expanded into the switches they name before anything reads them
+#endif
 int main(int argc, char **argv) {
+#if __has_include("presets.inc")
+    dm_profile_presets();
+#endif
     { int mtl_pso_prebuild_tool(void); int r = mtl_pso_prebuild_tool(); if (r) return r == 2; }   // DM_PSO_PREBUILD=tool: what a first start would build, made with no game (nvn_mtl.m)
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {

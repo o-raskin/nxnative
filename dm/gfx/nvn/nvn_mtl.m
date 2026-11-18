@@ -760,7 +760,7 @@ void mtl_init(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
     }
@@ -5946,6 +5946,11 @@ static id<MTLBuffer> c1_bank(size_t room) {
     return g_c1_banks.lastObject;
 }
 
+#if TARGET_OS_OSX && __has_include("shader_runtime.inc")
+#include "shader_runtime.inc"
+#define NVN_PROFILE_SHADER_CONSTANTS 1
+#endif
+
 static void c1_store(NvShader *o) {
     size_t len = o->rf.c1_len;
     NSString *guardKey = [NSString stringWithUTF8String:o->key];
@@ -5961,6 +5966,9 @@ static void c1_store(NvShader *o) {
     if (!b) { os_unfair_lock_unlock(&g_c1_lock); MDIE("c1 buffer block allocation failed"); }
     size_t off = g_c1_bank_off;
     memcpy((uint8_t *)b.contents + off, o->rf.c1, len);
+#ifdef NVN_PROFILE_SHADER_CONSTANTS
+    nvn_profile_shader_constants(o->key, (uint8_t *)b.contents + off, len);
+#endif
     g_c1_bank_off += dedicated ? C1_DECL_SIZE : need + 256u;
     g_c1_data_bytes += len;
     g_c1_count++;
@@ -6184,6 +6192,9 @@ static id<MTLFunction> fn_dev_b(id<MTLFunction> f, int off) {
 }
 static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e);   // a compute shader's pipeline: from the archive bundled with the app, else built
 // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
+#if TARGET_OS_OSX && __has_include("graphics_runtime.inc")
+static id<MTLLibrary> nvn_profile_shader_library(NSString *key);   // a game profile's own library for a shader key (nil: the translated one)
+#endif
 static NvShader *shader_load(NSString *pc, int stage, int layer) {
     NSError *e = nil;
     NSData *jd = msl_data([NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]);
@@ -6196,6 +6207,9 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 2 && !j) return nil;   // missing geometry translation: the caller's red line says so
     NSString *lp = [NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, pc];
     id<MTLLibrary> lib = lib_from_file(lp, &e);
+#if TARGET_OS_OSX && __has_include("graphics_runtime.inc")
+    { id<MTLLibrary> ov = lib ? nvn_profile_shader_library(pc) : nil; if (ov) lib = ov; }
+#endif
     if (!lib || !j) { MLOG("[RED] failed to load shader %s: %s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "no reflection json"); return nil; }
     if (![j[@"chain"] isEqual:@DMSH_CHAIN]) { MLOG("[RED] shader %s has translation chain version %s, but this host expects %s", pc.UTF8String, [[j[@"chain"] description] UTF8String], DMSH_CHAIN); return nil; }
     if (layer && !j[@"entry_layer"]) { MLOG("[RED] vertex shader %s has no layer entry points", pc.UTF8String); return nil; }
@@ -7227,6 +7241,9 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
     d.mipFilter = p.minf <= 1 ? MTLSamplerMipFilterNotMipmapped : (p.minf == 2 || p.minf == 3) ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
     d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
+    static float texture_bias; static int texture_bias_read;
+    if (!texture_bias_read) { texture_bias = nvn_texture_bias_env(getenv("DM_NVN_TEXTURE_BIAS")); texture_bias_read = 1; if (texture_bias) MLOG("DM_NVN_TEXTURE_BIAS: surface mip bias %+g", texture_bias); }
+    p.lod_bias = nvn_texture_bias(p.minf, p.magf, p.cmp_mode, p.reduction, p.lod_min, p.lod_max, p.lod_bias, texture_bias);
     d.lodBias = p.lod_bias < -16 ? -16 : p.lod_bias > 15.99f ? 15.99f : p.lod_bias;   // SetLodBias: Maxwell's sampler bias, Metal 26's range [-16, 15.99]
     static int aniso_floor = -1; if (aniso_floor < 0) { aniso_floor = nvn_aniso_env(getenv("DM_NVN_ANISO")); if (aniso_floor) MLOG("DM_NVN_ANISO: surface samplers filter with anisotropy %d or more", aniso_floor); }
     float aniso = nvn_aniso_floor(p.minf, p.magf, p.cmp_mode, p.reduction, p.lod_min, p.lod_max, p.aniso, aniso_floor);   // nvn_aniso.h: a floor for the game's surface samplers, off by default
@@ -11482,6 +11499,10 @@ static uint64_t ub_padded(NvShader *sh, int st, int reg, const p_bind_buf *u, ui
 }
 // A CBUF slot's GPU address, and in *use the buffer it points into: the bound uniform buffer; the shadow of inline updates deferred in this pass; an arena copy padded with zeros
 // when the binding is shorter than the shader reads it at fixed offsets (ub_padded); or the all-zero bank when nothing usable is bound. The full encode and the patch take it from here
+#if TARGET_OS_OSX && __has_include("graphics_runtime.inc")
+#include "graphics_runtime.inc"
+#define NVN_PROFILE_GRAPHICS 1
+#endif
 static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __strong id<MTLBuffer> *use) {
     int reg = b->reg; const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
     void *mb; uint64_t mo, gpu;
@@ -11499,6 +11520,10 @@ static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __str
     if (__builtin_expect(ub_bound(u->size) < 4u * b->fixw, 0)) {   // bound shorter than the shader reads it at fixed offsets: those reads give 0, as on Maxwell
         void *rb; uint64_t ro, rg, live = u->size && mtl_gpu_addr(u->addr, ub_bound(u->size), &rb, &ro, &rg) && rb == mb ? ub_bound(u->size) : u->size;   // the pool may end before the rounded size
         return ub_padded(sh, nvn_stage, reg, u, live, 4u * b->fixw, (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo, use); }
+#ifdef NVN_PROFILE_GRAPHICS
+    uint64_t tuned = nvn_profile_uniform(sh, nvn_stage, reg, cb_len(sh, reg, u->size), use);
+    if (tuned) return tuned;
+#endif
     *use = (__bridge id<MTLBuffer>)mb;
     uint64_t ul = cb_len(sh, reg, u->size);   // what the shader can read of it
     if (g_nubd && ubd_hits(u->addr, u->addr + ul)) {   // inline updates deferred in this pass (see mtl_sub_update); ubd_conflict made sure they cover the binding or the rest can be read from memory
@@ -14459,6 +14484,9 @@ static int skip_fs_draw(NvProg *pr) {
     return 0;
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
+#ifdef NVN_PROFILE_GRAPHICS
+    nvn_profile_graphics_draw();
+#endif
     cp_stamp start=cp_begin();
     if(dw && dw->prim==DM_PRIM_MESH_TASKS) mesh_tasks_draw(dw); else draw_(dw,di);
     if(g_kd_gpu_pending) { NvProg *p=g_kd_gpu_pending; g_kd_gpu_pending=nil; kd_gpu_readback(p); }
@@ -16100,6 +16128,9 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
+#ifdef NVN_PROFILE_GRAPHICS
+                nvn_profile_graphics_pass(r);
+#endif
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
@@ -16575,6 +16606,21 @@ int mtl_display_hz(void) {
 static _Atomic uint64_t g_present_stall_ns;   // For unit tests: an extra pause before each present on the present thread (simulating a drawable that stays unavailable)
 static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
+// DM_PRESENT_QUALITY (the picture's own scaling and sharpening in the present, off by default): off = the plain bilinear sample; scale = Catmull-Rom when the picture is shown at its size or
+// larger and a box filter over each output pixel's footprint when it is shown smaller (a 5K picture in a smaller window); sharp_low / sharp / sharp_high add contrast adaptive sharpening
+// (0.3 / 0.55 / 0.8). The shader (dm/gfx/msl/present.metal) reads post = {sharpening, mode, source width, source height}
+static void present_post(float post[4], NSUInteger tw, NSUInteger th) {
+    static int mode = -1; static float sharp;
+    if (mode < 0) {
+        const char *e = getenv("DM_PRESENT_QUALITY"); mode = 0; sharp = 0;
+        if (e && !strcmp(e, "scale")) mode = 1;
+        else if (e && !strcmp(e, "lanczos")) mode = 3;
+        else if (e && !strncmp(e, "sharp", 5)) { mode = 2; sharp = !strcmp(e, "sharp_low") ? .3f : !strcmp(e, "sharp_high") ? .8f : .55f; }
+        else if (e && *e && strcmp(e, "off")) MLOG("[RED] DM_PRESENT_QUALITY=%s: off, scale, lanczos, sharp_low, sharp or sharp_high", e);
+        if (mode) MLOG("present quality (DM_PRESENT_QUALITY): %s, dithered", mode == 1 ? "clean scaling" : mode == 3 ? "Lanczos scaling" : "clean scaling and sharpening");
+    }
+    post[0] = sharp; post[1] = (float)mode; post[2] = (float)tw; post[3] = (float)th;
+}
 static void present_pipeline(MTLPixelFormat format) {
     if (!g_blit_pso || g_blit_fmt != format) {
         NSError *e = nil;
@@ -16687,8 +16733,9 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
     [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+    float uv[12] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
+    present_post(uv + 8, src.width, src.height);
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -16939,6 +16986,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     uv[0] = (float)cx / tw; uv[1] = (float)cy / th; uv[2] = (float)cw / tw; uv[3] = (float)ch / th;
     uv[4] = (cx + 0.5f) / tw; uv[5] = (cy + 0.5f) / th; uv[6] = (cx + cw - 0.5f) / tw; uv[7] = (cy + ch - 0.5f) / th;
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
+    present_post(uv + 8, tw, th);
     [g_present_args setAddress:uvb.gpuAddress atIndex:0];
     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -16949,7 +16997,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
 // returns whether it was submitted. Completion reports the encoding kind, or PRESENT_FAILED on a GPU error. Resources remain resident and retained until GPU completion.
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
     id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
-    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
     if (!al || !cb || !uvb) { MLOG("[RED] offscreen present: no command allocator or buffer"); return 0; }
     id<MTLTexture> raw = present_raw_src(src);
     fx_state fx = {0};

@@ -110,7 +110,14 @@ def build(gid, patched, control):
         parts = v.split('?', 1)
         return len(parts) == 1 or all(shown(c, n) for c in parts[1].split('&'))
 
+    defaults = {}
+    for row in g.values('setting_default'):
+        if len(row) != 2 or row[0] in defaults:
+            sys.exit(f'{g.id}: setting_default requires a unique variable and value')
+        defaults[row[0]] = row[1]
     out, table, base = [], {r[1][0]: takes(r[1][1], r[1][2]) for r in rows()}, render_base(g)
+    if defaults.keys() - table.keys():
+        sys.exit(f'{g.id}: setting_default names an unknown setting')
     for n, (var, kind, values, default, cond, section, label, note, extra) in rows():
         m = meta(extra, n)
         if 'needs' in m:
@@ -119,7 +126,7 @@ def build(gid, patched, control):
             can = table[need]
             if can is not None and want not in can: sys.exit(f'settings.tsv:{n}: needs a value {need} never takes: {want} (it takes {", ".join(sorted(can))})')
         if not shown(cond, n): continue
-        s = {'env': var, 'kind': kind, 'section': section, 'label': label, 'note': note, 'default': value(default, n), **m}
+        s = {'env': var, 'kind': kind, 'section': section, 'label': label, 'note': note, 'default': value(defaults.get(var, default), n), **m}
         if var == 'DM_RENDER_SCALE' and base: s['base'] = base   # the render scale in pixels, for the console mode chosen
         if kind == 'choice':
             opts = [list(l) for l in langs] if values == 'languages' else [v.split('?', 1)[0].split('=', 1) for v in values.split(',') if offered(v, n)]

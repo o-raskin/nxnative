@@ -57,7 +57,7 @@ class Timing(unittest.TestCase):
 
     def read32(self, a): return struct.unpack('<I', self.u.mem_read(a, 4))[0]
     def step(self, vsyncs=1, variable=True):
-        self.u.mem_write(self.state+0x20, struct.pack('<I', vsyncs))
+        self.u.mem_write(self.state+0x20, struct.pack('<I', vsyncs * 2))
         self.u.reg_write(arm.UC_ARM64_REG_W21, int(variable))
         self.execute(self.base+0x91dc10, self.base+0x91dcb4, count=500)
         self.assertEqual(self.u.reg_read(arm.UC_ARM64_REG_PC), self.base+0x91dcb4)
@@ -82,15 +82,28 @@ class Timing(unittest.TestCase):
         for v in (1, 2, 1, 3, 1)*20:
             dt, ticks = self.step(v); elapsed += dt; integral += ticks
             self.assertEqual(integral, int(elapsed))
-        self.assertEqual(struct.unpack('<Q', self.u.mem_read(self.state+0x30, 8))[0], 160)
+        self.assertEqual(struct.unpack('<Q', self.u.mem_read(self.state+0x30, 8))[0], 320)
 
     def test_cinematics_remain_thirty_and_release_the_cap(self):
         for _ in range(60): self.assertEqual(self.step(1, False), (1.0, 1))
         self.assertEqual(self.read32(self.state+4), 1)
-        self.assertEqual(self.read32(self.state+0x24), 2)
+        self.assertEqual(self.read32(self.state+0x24), 4)
         self.assertEqual(self.step(1), (0.5, 0))
         self.assertEqual(self.read32(self.state+4), 0)
         self.assertEqual(self.read32(self.state+0x24), 0)
+
+    def test_120_fps_keeps_thirty_game_ticks_per_second(self):
+        self.u.mem_write(self.state, struct.pack('<f', 120))
+        total = 0
+        for _ in range(120):
+            self.u.mem_write(self.state+0x20, struct.pack('<I', 1))
+            self.u.reg_write(arm.UC_ARM64_REG_W21, 1)
+            self.execute(self.base+0x91dc10, self.base+0x91dcb4, count=500)
+            self.assertEqual(struct.unpack('<f', self.u.mem_read(self.obj+0xd0,4))[0], 0.25)
+            total += self.read32(self.obj+0xd8)
+        self.assertEqual(total, 30)
+        self.assertEqual(self.step(0)[0], 0.25)
+        self.assertEqual(self.step(1, False), (1.0, 1))
 
     def test_initial_step_follows_target(self):
         self.assertEqual(self.step(0), (0.5, 0))

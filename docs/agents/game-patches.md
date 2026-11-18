@@ -57,7 +57,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | Game | Cuts | Gates | Frame-step and stub sites | Function-matched rules | Host rows | Binding |
 |---|---|---|---|---|---|---|
 | [Animal Crossing: New Horizons](#animal-crossing-new-horizons) | 0 | 0 | 14 | 0 | 0 | `build` → `game` |
-| [ASTRAL CHAIN](#astral-chain) | 0 | 0 | 112 | 0 | 0 | `build` → `game` |
+| [ASTRAL CHAIN](#astral-chain) | 0 | 0 | 114 | 0 | 0 | `build` → `game` |
 | [Batman: Arkham Knight](#batman-arkham-knight) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [DARK SOULS: REMASTERED](#dark-souls-remastered) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Diablo II: Resurrected](#diablo-ii-resurrected) | 2 | 0 | 0 | 1 | 0 | `game` |
@@ -121,7 +121,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`build` → `game`**, frame rate, kept: 1.0.1 (2019) is the last update; a function match would serve no other build of this game, checked: nso_fnmap of its 112 sites into those four mains (2026-11-09): 60 fps frame step (112 sites). The game's own clock and timers (a community 60 fps mod on the host's frame step). PlatinumGames' other games do not share them: none of its 15 functions has an exact match in Bayonetta, Bayonetta 2, Bayonetta 3 or NieR:Automata
 
-- **1.0.1 `main`** `4b159f0f…` ([patches.py:91](../../dm/games/01007300020FA000/patches.py#L91))
+- **1.0.1 `main`** `4b159f0f…` ([patches.py:92](../../dm/games/01007300020FA000/patches.py#L92))
   <details><summary>112 frame-step sites</summary>
 
   - frame step `+0xd5dd4`: frame step (0 = original): [hs] +0x2024 sibling path: bl hs_w8 0xa0ed80 (was subs w8, w8, #1)
@@ -239,6 +239,9 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
   </details>
 
+  - stub `+0x9db29c`: RHI completion is published after the last object access
+  - stub `+0x9db704`: RHI retirement waits for queued CPU initialization, including later nodes
+  - launcher capabilities: FPS_TICK_120
 
 ### Batman: Arkham Knight
 

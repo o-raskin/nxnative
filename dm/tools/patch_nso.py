@@ -1694,7 +1694,7 @@ obs += region_obs
 # its stubs run them at the cap, and the host only paces its presents (its patches.py).
 # State page = the page after the key page (zero in the file, read-write in both loaders): +0 float target fps written by the loader (fps_target, DM_FPS_TARGET; 0 = every stub
 # runs the original instructions), +4 30 fps movie/cinematic flag, +8 double lead (TOTK), +0x10 float render scale (TOTK, BotW), +0x18 double game seconds (TOTK),
-# +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
+# +0x20 u32 step in ticks (host; 0 = not decided yet; 1/60 s normally, 1/120 s when the build declares FPS_TICK_120), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
 # its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed), +0x40 u32 1 = the game's own dynamic resolution runs, 0 = its
 # stub holds full resolution (DM_DYNAMIC_RESOLUTION, written by the loader; the stub declares the DYNAMIC_RESOLUTION capability). Stub bodies assembled with clang
 # A build's stubs are FRAME_STEP[build ID](ctx) in its patches.py: ctx.here() / ctx.emit(word) assemble into the patch area, ctx.site(offset, original bytes) asserts a site and that it is

@@ -38,6 +38,8 @@ None of them has a default game: without one they stop and list the profiles. To
 
 Defaults may use `<ios>|<mac>` to select the platform's value before resolving a profile macro or build variable. For example, `DM_GAME_PSO_MTL4|1` follows the profile on iOS and the Mac host's always-on default on Mac; `1|0` matches the encode thread's iOS-on, Mac-off defaults. `SETTINGS_PLATFORM` accepts `ios` (the default) or `mac`; other values are rejected.
 
+Profiles may repeat `setting_default<TAB>DM_VARIABLE<TAB>value` to choose an adjustable launcher default from the setting's existing values. `ios|mac` selects a platform default. This does not enable an unsupported setting or change its availability conditions; runtime controls still require a matching manifest. ASTRAL CHAIN uses it for Mac texture filtering.
+
 ## Games
 
 One row per profile; the notes are each profile's `README.md`.

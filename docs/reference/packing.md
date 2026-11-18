@@ -529,3 +529,10 @@
 - **Fix:** `app_ready_image` requires a visible packed NVN image containing a Metal library and exactly the entries selected by the existing app-payload filter. Only that image uses the existing clone/copy path, honoring a renamed destination and the actual clone-capability/free-space probe. Full build images containing source, reports, hidden files or other excluded entries still use filtering. The input image is never edited.
 - **Check:** unit fixtures verify filtering is retained for excluded files, destination naming, byte-identical copies and actual APFS clone independence. Existing Mac packaging tests pass. Signing and index validation can still read the data; a clone does not mean no I/O or no packing time.
 - **Found on:** [Metroid Prime 4: Beyond audio checkpoints](../../dm/games/010019A01E2F2000/README.md#pcm-repetition-evidence-and-source-tracing-2026-11-12).
+
+### A profile-only present counter breaks other NVN host builds
+
+- **Symptom:** compiling a Mac NVN host fails at `nvnQueuePresentTexture` with `use of undeclared identifier 'g_nvn_presents'`.
+- **Cause:** the counter is declared only under `NVN_PROFILE_RUNTIME` (a profile with `nvn_runtime.inc`), but its increment was unconditional. Building Metroid Prime 4 hid the missing guard because that profile supplies the extension.
+- **Fix:** guard the increment with the same `NVN_PROFILE_RUNTIME` condition as its declaration and consumers. Other games retain their existing window-local present counter and frame-step behavior.
+- **Found on:** [ASTRAL CHAIN enhanced Mac build](../../dm/games/01007300020FA000/README.md#enhanced-mac-build-2026-11-16-current-experimental).

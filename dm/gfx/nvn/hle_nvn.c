@@ -1281,6 +1281,10 @@ NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddr
 // uniform update: the data is copied into command memory at record time (NVN semantics: the caller may modify the original data after recording) and written into the buffer at submit
 NVN(nvnCommandBufferUpdateUniformBuffer, void, NVNcommandBuffer *c, NVNbufferAddress buf, size_t bufsz, ptrdiff_t off, size_t n, const void *data) {
     (void)bufsz;
+    { static int ublog = -1; if (ublog < 0) ublog = getenv("DM_NVN_UBLOG_ORTHO") != NULL;   // diagnostic: who writes an orthographic 3x4 matrix (last row 0 0 0 1, small third row), e.g. a shadow cascade's
+      if (ublog && n >= 64) { const float *f = data; static int logged; float l = f[8]*f[8] + f[9]*f[9] + f[10]*f[10];
+        if (logged < 40 && f[12] == 0 && f[13] == 0 && f[14] == 0 && f[15] == 1 && l > 0 && l < 0.0025f) { logged++;
+            LOG("[ubortho] caller %#llx data %p size %zu: %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)(uintptr_t)__builtin_return_address(0), data, n, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]); } } }
     uint32_t sz = (uint32_t)(24 + n);
     uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, OP_UPDATE_UB, (sz + 7) & ~7u);
     uint64_t dst = buf + off, nn = n; memcpy(p + 8, &dst, 8); memcpy(p + 16, &nn, 8); memcpy(p + 24, data, n);
@@ -2356,20 +2360,20 @@ static int thermal_capped(void) {
 // A game may step by its target whatever the frames really take (Fire Emblem Fortune's Weave: 60.0 / target a frame), so a target of 120 at 70 frames a second is a game at 58% speed, and
 // on a 60 Hz screen at half speed: late frames step the hold up (nvn_fstep.h), the target follows the hold, and the game's step stays what the screen shows. The cap is 60 on a screen
 // below 120 Hz, while a movie plays (its pictures are paced for the Switch's 30 and 60) and under the thermal cap. No window (headless): nothing limits the rate but the pacer's clock.
-// A game with a frame step state page is out: its stubs hand the game whole vsyncs of 1/60 s
+// A state-page game opts into 120 only with the verified FPS_TICK_120 ABI. Legacy stubs retain 1/60-second units.
 static int g_fps_high = -1;
 static _Atomic int g_high_cap = 60;
 static int fps_high(void) {
     int v = __atomic_load_n(&g_fps_high, __ATOMIC_RELAXED);
     if (v < 0) {
         const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
-        v = t == 120 && DM_GAME_FPS_MAX >= 120 && !dm_fps_state && dm_fps_lock_engine();
-        if (t == 120 && DM_GAME_FPS_MAX >= 120 && !v) LOG("[RED] [nvn] 120 fps: this main has %s, so it runs at 60", dm_fps_state ? "a frame step in whole vsyncs" : "no engine frame limit the host writes");
+        v = t == 120 && DM_GAME_FPS_MAX >= 120 && (dm_fps_state ? dm_fps_tick_hz == 120 : dm_fps_lock_engine());
+        if (t == 120 && DM_GAME_FPS_MAX >= 120 && !v) LOG("[RED] [nvn] 120 fps: this main has %s, so it runs at 60", dm_fps_state ? "a legacy 60-Hz frame-step ABI" : "no engine frame limit the host writes");
         __atomic_store_n(&g_fps_high, v, __ATOMIC_RELAXED);
     }
     return v;
 }
-static int fstep_hz(void) { return fps_high() ? 120 : 60; }   // the ticks the frame step counts in
+static int fstep_hz(void) { return dm_fps_state ? dm_fps_tick_hz : fps_high() ? 120 : 60; }   // the ticks the frame step counts in
 // Once per present: what the screen and the game's state allow now, and a display link at the rate the screen can show (DM_PRESENT_LINK keeps its own choice)
 static void high_cap_tick(void) {
     static int win = -1, link_env = -1;
@@ -2386,7 +2390,7 @@ static int fps_step_cap(void) {
     // Movies and a 30 fps target still need thermal samples: heat must reset the
     // calm interval, and cooling during those caps counts towards recovery.
     int thermal = thermal_capped();
-    return dm_movie_playing() || t <= 30 || thermal ? 30 : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
+    return dm_movie_playing() || t <= 30 || thermal ? 30 : t >= 120 && dm_fps_tick_hz == 120 ? atomic_load(&g_high_cap) : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
 // Engine-native frame limiters have no frame-step state page. Their requested
@@ -2458,7 +2462,16 @@ static int window_interval(const win_t *o) { present_cfg(o); return g_display_mo
 // DM_PRESENT_LINK=2) one tick of the present rate, as many link ticks as that takes. Before, a 120 Hz link waited two ticks per frame there, and display mode never went past 60 fps
 static int link_wait(const win_t *o, uint64_t timeout_ns) {
     static int hz_was, rate_was, remainder;   // acquire thread only, as with mtl_link_wait_ticks
-    if (fps_high()) { int t = present_itv(o) * mtl_link_rate() / 120; return mtl_link_wait_ticks(t < 1 ? 1 : t, timeout_ns); }   // the hold, in ticks of 1/120 s, on a link at 120 or 60 Hz
+    // A capped or stepped frame's hold counts in the frame step's own ticks (present_itv): 1/120 s for a 120-Hz frame-step ABI (the Astral Chain state page) at every target, not only 120.
+    // Read as 60 Hz vsyncs a 30 fps hold of 4 ticks waited 66.7 ms (15 fps at 0.6 of real time in the app's display-link path), and 60 fps waited 33 ms. Without a cap the hold is the game's own interval, in 60 Hz vsyncs.
+    if (fstep_hz() == 120 && (fps_present_cap() || fps_high())) {   // the hold, in ticks of 1/120 s, on a link at 120 or 60 Hz
+        // A hold that is not a whole number of link ticks (3 of 1/120 s on a 60 Hz link: 1.5) keeps its remainder, taking 1 and 2 ticks in turn: truncated to 1 tick the game's time ran 7 % ahead of
+        // the clock at 5K (hold 3, GPU 22.7 ms), and rounded up to 2 it would have run slow
+        static int rem, itv_was, rate_was; int itv = present_itv(o), rate = mtl_link_rate();
+        if (itv != itv_was || rate != rate_was) { rem = 0; itv_was = itv; rate_was = rate; }
+        int num = itv * rate + rem, t = num / 120; rem = num % 120;
+        if (t < 1) { t = 1; rem = 0; }
+        return mtl_link_wait_ticks(t, timeout_ns); }
     int hz = g_display_mode && !fps_present_cap() && g_hz > 60 ? g_hz : 0, rate = mtl_link_rate();
     if (hz != hz_was || rate != rate_was) { remainder = 0; hz_was = hz; rate_was = rate; }
     if (hz) {
@@ -2528,7 +2541,7 @@ static void fstep_tick(const win_t *o, int c) {
     double shown = prev ? (st - prev) / v : 0, gpu = 0; prev = st;
     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
     double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
-    int kmin = fstep_hz() / c, kmax = fps_high() ? 2 : !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k,   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
+    int kmin = fstep_hz() / c, kmax = fps_high() && !dm_fps_state ? 2 : !fstep_hold() ? kmin : kmin >= fstep_hz() / 30 ? fstep_hz() / 30 : fstep_hz() / 20, k0 = g_fs.k,   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
          kmin0 = g_fs.kmin, probe0 = g_fs.probe;
     int fixed = dm_fps_state ? (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED) : 0;
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
@@ -2553,8 +2566,8 @@ static void fstep_tick(const win_t *o, int c) {
     // (Breath of the Wild on an M5 Pro: the probe's 33 frames took the clock 338 → 432 MHz and its GPU time 24.8 → 18.5 ms, then it failed at 22 ms frames; hold 1 needed about 560 MHz)
     g_fs.ramp = mtl_probe_ramp_on();
     g_fs.per_vsync = fstep_hz() / 60;
-    g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
-    g_fs.no_payback = fps_high();   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
+    g_fs.smax = dm_fps_step_max ? dm_fps_step_max : fstep_hz() / 20;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
+    g_fs.no_payback = fps_high() && !dm_fps_state;   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
     atomic_store(&g_fs_k, g_fs.k);
@@ -2579,8 +2592,8 @@ static void fstep_tick(const win_t *o, int c) {
         if (o->presents % 1800 == 0) { LOG("[nvn] 120 fps: held 1 / 2 ticks %llu / %llu frames, %llu late, %llu up / %llu down (%llu probes, %llu failed trials)", (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)g_fs.late, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed); memset(held, 0, sizeof held); }
     } else if (o->presents % 1800 == 0) {   // game time against real time (1.000 = normal speed; lower when a device cannot hold 20 fps or after long stalls)
         uint64_t vs = __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns();
-        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
-                    (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
+        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 / 4 / 5 / 6 ticks %llu / %llu / %llu / %llu / %llu / %llu frames, %llu late, %llu ticks paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
+                    (vs - v0) / (double)fstep_hz(), (t - t0) / 1e9, (vs - v0) / (double)fstep_hz() / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3], (unsigned long long)held[4], (unsigned long long)held[5], (unsigned long long)held[6],
                     (unsigned long long)g_fs.late, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed);
         t0 = t; v0 = vs; memset(held, 0, sizeof held);
     }
@@ -2600,7 +2613,9 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
     return lc;
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+#ifdef NVN_PROFILE_RUNTIME
     atomic_fetch_add(&g_nvn_presents, 1);
+#endif
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();

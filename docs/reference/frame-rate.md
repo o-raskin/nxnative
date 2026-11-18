@@ -4,6 +4,23 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 
 ## Frame step
 
+### A frame-step stub with sub-60 FPS units
+
+- **Symptom:** a launcher cannot offer 120 fps to a game using the host state page; changing the cap alone either remains at 60 or truncates its game-time step to zero.
+- **Cause:** legacy state-page stubs consume integral 1/60-second ticks. At 120 fps, half a tick cannot be represented. Cinematics also require four 1/120-second ticks instead of two legacy ticks.
+- **Fix:** a verified stub may declare `FPS_TICK_120`. The loader and pacer then share a 120-Hz unit, retain up to six ticks of storage, and convert elapsed diagnostics with that unit. Legacy builds keep their three-tick limit. The game stub converts one tick to 0.25 of its 30-Hz clock and retains the fractional carry for integer timer consumers. Movies and fixed-step cinematics still request 30 fps; displays below 120 Hz retain a 60-fps cap.
+- **Found on:** [ASTRAL CHAIN](../../dm/games/01007300020FA000/README.md#graphics-controls), verified 1.0.1. ARM execution tests cover all three caps and fractional timer carry; the shared pacer tests cover transitions into and out of four-tick cinematics.
+
+
+### A 120-Hz frame-step game's hold waited in 60-Hz display-link ticks
+
+- **Symptom:** in the app's own presentation path (display link, `DM_PRESENT_LINK` unset) a game with a `FPS_TICK_120` stub ran at half the chosen rate: a 30 fps target gave a frame every 66-69 ms with game time 0.61 of real time, 60 fps gave 33 ms. 120 fps was right, and every run with `DM_PRESENT_LINK=0` (direct present) was right, so scripted screenshot runs missed it.
+- **Cause:** `link_wait` (`dm/gfx/nvn/hle_nvn.c`) read the capped hold `present_itv` as 60-Hz vsyncs unless the target was 120; with 120-Hz units a 30 fps hold of 4 ticks waited four 60-Hz ticks.
+- **Fix:** a capped or stepped frame's hold counts in the frame step's own ticks (`fstep_hz()`), converted to link ticks by the link's rate; without a cap the game's interval stays in 60-Hz vsyncs.
+- **Measured (packaged app's own host, window in front, 1440p, Highway Rescue, copied save):** 30 fps: frame time p50 33.33 / p95 33.45 ms, game time 1.000 of real time; 60 fps (with occlusion and bounce light High): 16.66 / 16.77 ms, 1.000; 120 fps: 8.33 / 8.43 ms, 1.000 (a few early-load frames late). A covered window (focus lost) stalls the display link and shows 68 ms frames at any target: keep the window frontmost when measuring.
+- **Remainder (5K, 2026-11-17):** a hold that is not a whole number of link ticks (3 of 1/120 s on a 60 Hz link = 1.5) keeps its remainder in `link_wait` (1 and 2 ticks in turn); truncated, game time ran 7.2 % ahead of the clock at 5K, now 1.000.
+- **Found on:** [ASTRAL CHAIN](../../dm/games/01007300020FA000/README.md#frame-rate-check-in-the-display-link-path-2026-11-17).
+
 ### Frame cap checked and used from the same sample
 
 - **Symptom:** clang reports division by zero in `fstep_tick` (`hle_nvn.c`).

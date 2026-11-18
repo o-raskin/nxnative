@@ -30,7 +30,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define FSTEP_MAX 3           // the largest step: both games' own interval logic uses 1–3 (BotW clamps to [2, 3], TOTK picks 2 or 3), so their integer readers never see 4
+#define FSTEP_MAX 6           // storage bound: 3 legacy 60-Hz ticks or 6 ticks at 120 Hz; smax keeps each stub within its ABI
 #define FSTEP_LATE 0.1        // a frame is late when it or its GPU work took this many vsyncs (1.7 ms) more than k: 53 fps is not 60 (start-to-start jitter on time is well below)
 #define FSTEP_SHORT_MAX 2.0  // a frame counts at most this many vsyncs past its hold toward the average (a load's stall is one long frame, not a rate)
 #define FSTEP_FIT 0.85        // a frame would fit k − 1 when its cost is at most this share of it
@@ -82,7 +82,8 @@ static inline int nvn_fstep_same(const nvn_fstep *s) { return s->cref > 0 && s->
 static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int kmin, int kmax, int fixed, int slow) {
     const double hold0 = FSTEP_HOLD0 * (s->per_vsync ? s->per_vsync : 1), hold_max = FSTEP_HOLD_MAX * (s->per_vsync ? s->per_vsync : 1);
     if (kmin < 1) kmin = 1;
-    const int smax = s->smax > 0 && s->smax < FSTEP_MAX ? s->smax : FSTEP_MAX;
+    const int legacy_max = 3 * (s->per_vsync ? s->per_vsync : 1);
+    const int smax = s->smax > 0 && s->smax < FSTEP_MAX ? s->smax : legacy_max < FSTEP_MAX ? legacy_max : FSTEP_MAX;
     if (kmax > smax) kmax = smax;
     if (kmin > smax) kmin = smax;
     if (kmax < kmin) kmax = kmin;

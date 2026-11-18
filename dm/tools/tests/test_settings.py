@@ -39,4 +39,27 @@ class UpscalerSetting(unittest.TestCase):
                 self.assertEqual(bool(up),shown,gid)
                 if up:self.assertEqual((up[0]['default'],up[0]['options']),('game',[['game',"Game's own"],['metalfx','MetalFX']]))
 
+class ProfileDefaults(unittest.TestCase):
+    def test_profile_default_is_adjustable_and_mac_only(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(settings.nacp,'languages',return_value=['en-US']):
+            (Path(tmp)/'main.fixups.tsv').write_text('')
+            for platform in ('mac','ios'):
+                with patch.dict(settings.os.environ,{'SETTINGS_PLATFORM':platform,'GFXAPI':'nvn'}):
+                    rows=settings.build('01007300020FA000',tmp,'unused')['settings']
+                aniso=[r for r in rows if r['env']=='DM_NVN_ANISO']
+                self.assertEqual(bool(aniso),platform=='mac')
+                if aniso:
+                    self.assertEqual(aniso[0]['default'],'16')
+                    self.assertIn(['0','Game default'],aniso[0]['options'])
+                self.assertFalse(any(r['env']=='DM_AC_RESOLUTION' for r in rows))
+
+    def test_other_profiles_keep_their_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(settings.nacp,'languages',return_value=['en-US']),patch.dict(settings.os.environ,{'SETTINGS_PLATFORM':'mac','GFXAPI':'nvn'}):
+            (Path(tmp)/'main.fixups.tsv').write_text('')
+            for gid in ('01004A4010FEA000','010019A01E2F2000','010015100B514000','0100F2C0115B6000','01007300020FA000'):
+                rows=settings.build(gid,tmp,'unused')['settings']
+                self.assertEqual(len(rows),len({r['env'] for r in rows}))
+                aniso=next(r for r in rows if r['env']=='DM_NVN_ANISO')
+                self.assertEqual(aniso['default'],'16' if gid=='01007300020FA000' else '0')
+
 if __name__=='__main__':unittest.main()
