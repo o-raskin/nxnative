@@ -1,5 +1,5 @@
 # ASTRAL CHAIN 1.0.1, main 4b159f0f7a360669738390ee8657b4f0.
-# Host-paced 60 fps gameplay; fixed-step cinematics retain 30 fps for audio sync.
+# Host-paced 30/60/120 fps gameplay; fixed-step cinematics retain 30 fps for audio sync.
 # Target 0 runs the original instructions at every hook. Helpers live in the
 # rewriter's patch area, never in upstream's padding / empty-function caves.
 # Integer timer and camera helpers adapted from AstralChain-Dynamic-FPS v1.1.1:
@@ -24,7 +24,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from nso_asm import ADRP, ADDI, B, STP_PRE, LDP_POST
+from nso_asm import ADRP, ADDI, B, BL, BLR, STP, LDP, STRX, LDRX, SUBI, STP_PRE, LDP_POST
 
 
 def signed(n, bits):
@@ -57,6 +57,7 @@ def relocate(w, old, new, targets):
 
 
 def frame_step(ctx):
+    if hasattr(ctx, 'capabilities'): ctx.capabilities.add('FPS_TICK_120')
     # At main+0x91dc10 x19 is the clock, w21 selects elapsed-time gameplay
     # (0 is fixed-step cinematics), x20 is this frame's timestamp. The ordinary
     # epilogue restores d8/x19/x20/x21. s0/s1/s2 and x8/x16/x17 are scratch here.
@@ -90,16 +91,190 @@ def frame_step(ctx):
 
 FRAME_STEP = {'4b159f0f7a360669738390ee8657b4f0': frame_step}
 
-# Core: frame-state +4 marks a 30 fps cinematic; +0x24 fixes its step at two
-# vsyncs. Gameplay takes the host's step (+0x20), or 60 / target before the first
+
+def shadow_pool_words(start, extra):
+    # Add the atlas's exact extra D24S8 backing bytes to whichever resolution's
+    # arena was selected. Preserve both scratch registers and the original SP.
+    return (STP_PRE(16, 17, 31, -16),
+            0xd2a00010 | ((extra >> 16) << 5),  # movz x16,#extra>>16,lsl #16
+            0x8b100108,                        # add x8,x8,x16
+            LDP_POST(16, 17, 31, 16),
+            0xf90047e8,                        # str x8,[sp,#0x88]
+            B(start + 20, 0x40e0b8))
+
+
+def quality_stubs(ctx):
+    # Retiring an RHI resource does not cancel its queued CPU initialization.
+    # At 60 fps / 5K the frame collector reaches a still-pending buffer before
+    # the worker. Keep the ordered retirement bucket until the task completes.
+    # Publish completion only after the worker's last access to the object;
+    # the collector's acquire then also protects that final +0x48 store.
+    ctx.site(0x9db704, '181840f9')
+    start = ctx.here()
+    for word in retire_ready_words(start):
+        ctx.emit(word)
+    ctx.put(0x9db704, [B(0x9db704, start)], 'RHI retirement waits for queued CPU initialization, including later nodes')
+    ctx.site(0x9db29c, '886200911ffd5f881ffd0988c9ffff359f2600f9')
+    ctx.put(0x9db29c, list(task_complete_words()), 'RHI completion is published after the last object access')
+    ctx.site(0x40e0b4, 'e84700f9')
+    for name, atlas in (('AC_SHADOW_HIGH', 4096), ('AC_SHADOW_ULTRA', 8192)):
+        start = ctx.here()
+        for word in shadow_pool_words(start, (atlas * atlas - 2048 * 2048) * 4):
+            ctx.emit(word)
+        ctx.runtime_exports[name] = start
+    ctx.site(0x3ffbf8, 'e00313aa')
+    start = ctx.here()
+    for word in luma_reduce_words(start):
+        ctx.emit(word)
+    ctx.runtime_exports['AC_LUMA_REDUCE'] = start
+    # Model thresholds and final disappearance are independent controls. Each
+    # helper preserves the caller's registers and NZCV, including vector lanes.
+    ctx.site(0xa0e7b0, '501d00d0112e41f91062099120021fd6')  # nvnBootstrapLoader PLT
+    for site, original, event, before in ASPECT_SITES:
+        ctx.site(site, original)
+        start = ctx.here()
+        for word in aspect_words(start, site, original, event, before):
+            ctx.emit(word)
+        ctx.runtime_exports[f'AC_ASPECT_{site:X}'] = start
+    # Shadow range: the cascade split distances (view distance in metres; the data of the area, blended by main+0x420100 into the cascade set's +0x14..0x20)
+    # are copied into the array at main+0xd6faf0 that the cascade fit (main+0x420a00) reads. The stub does that copy scaled by a factor.
+    ctx.site(RANGE_SITE, RANGE_ORIGINAL)
+    for choice, imm8 in RANGE_CHOICES:
+        start = ctx.here()
+        for word in range_words(start, imm8):
+            ctx.emit(word)
+        ctx.runtime_exports[f'AC_RANGE_{choice.upper()}'] = start
+    for site, original, source, slot in DETAIL_SITES:
+        ctx.site(site, original)
+        for choice, factor in (('x2', 0.5), ('x4', 0.25), ('high', 0.0)):
+            start = ctx.here()
+            for word in detail_words(start, site, source, slot, factor):
+                ctx.emit(word)
+            ctx.runtime_exports[f'AC_DETAIL_{site:X}_{choice.upper()}'] = start
+
+
+RANGE_SITE = 0x420a34
+RANGE_ORIGINAL = '681640b9'   # ldr w8,[x19,#0x14], the first of the 14 instructions (to 0x420a68) that copy the four splits and set up the fit's calls
+RANGE_CHOICES = (('x1_5', 0x1e2f1001), ('x2', 0x1e201001), ('x3', 0x1e211001), ('x4', 0x1e221001))   # fmov s1,#1.5 / 2 / 3 / 4
+
+
+def range_words(start, fmov):
+    """The original block, with each split multiplied by s1 on the way: ldr s0,[x19,#off]; fmul s0,s0,s1; str s0,[x24,#k]. s0 and s1 are not live there
+    (the function's first float use is main+0x420a84). x24 is main+0xd6faf0 (the page is made with ADRP from the stub's own address)."""
+    words = [fmov]
+    for k, off in enumerate((0x14, 0x18, 0x1c, 0x20)):
+        words.append(0xbd400000 | ((off // 4) << 10) | (19 << 5))   # ldr s0,[x19,#off]
+        words.append(0x1e210800)                                     # fmul s0,s0,s1
+        if k == 0:
+            words.append(ADRP(24, start + len(words) * 4, 0xd6f000))
+            words.append(ADDI(24, 24, 0xaf0))
+        words.append(0xbd000000 | ((4 * k // 4) << 10) | (24 << 5))  # str s0,[x24,#4*k]
+    words += [0x2a0103fb, ADDI(0, 19, 0x98), ADDI(1, 19, 8), 0x52800782]   # mov w27,w1; add x0,x19,#0x98; add x1,x19,#8; mov w2,#0x3c
+    words.append(B(start + len(words) * 4, 0x420a6c))
+    return words
+
+
+def retire_ready_words(start):
+    return (STP_PRE(16, 17, 31, -16), ADDI(16, 0, 0x18),
+            0x88dffe11,                  # ldar w17,[x16]: task pending
+            0x35000091,                  # cbnz w17,pending (instruction 7)
+            LDP_POST(16, 17, 31, 16), 0xf9401818,  # ldr x24,[x0,#0x30]
+            B(start + 24, 0x9db708),
+            LDP_POST(16, 17, 31, 16), B(start + 32, 0x9db730))
+
+
+def task_complete_words():
+    return (0xf900269f,                  # str xzr,[x20,#0x48]
+            ADDI(8, 20, 0x18), 0x889ffd1f,  # stlr wzr,[x8]: last object access
+            0xd503201f, 0xd503201f)
+
+
+def luma_reduce_words(start):
+    # The exposure shaders reduce at most 256 workgroup sums. Above 1440p,
+    # the 1/16 image exceeds that limit. Populate the existing 1/32 texture
+    # with one more ordinary downsample, then use it for exposure only.
+    # The outer function already saved LR; volatile registers are dead at
+    # this call boundary. x23 intentionally becomes the new source texture.
+    return (0xaa1303e0, 0xaa1703e1, ADDI(23, 21, 0xa0),
+            0xaa1703e2, 0x320003e3,
+            B(start + 20, 0x99b190) | 0x80000000,
+            0xaa1303e0, B(start + 28, 0x3ffbfc))
+
+
+# Threshold stores verified in model defaults and named-parameter reader.
+# Source discovery: captainj-sparrow/astral-chain-pc-recomp, patches-v101.txt
+# (MIT). Binary addresses and calling conventions checked against this NSO.
+DETAIL_SITES = (
+    (0x551df0, '090100b9', 'w9', 0), (0x551e0c, '090500b9', 'w9', 1),
+    (0x551e28, '090900b9', 'w9', 2), (0x551e44, '090d00b9', 'w9', 3),
+    (0x55f0ec, '000100bd', 's0', 0), (0x55f134, '000500bd', 's0', 1),
+    (0x55f17c, '000900bd', 's0', 2), (0x55f1c4, '000d00bd', 's0', 3),
+)
+
+
+def detail_words(start, site, source, slot, factor):
+    # q30/q31 are volatile by ABI but live at an inline hook: preserve all lanes.
+    # FMUL does not change NZCV. W9/S0 and the original SP are untouched.
+    return (0xadbf7ffe,  # stp q30,q31,[sp,#-32]!
+            0x1e27013e if source == 'w9' else 0x1e20401e,
+            {0.5: 0x1e2c101f, 0.25: 0x1e2a101f, 0.0: 0x1e2703ff}[factor],
+            0x1e3f0bde,  # fmul s30,s30,s31
+            0xbd00011e | (slot << 10),  # str s30,[x8,#slot*4]
+            0xacc17ffe, B(start + 24, site + 4))
+
+
+ASPECT_SITES = (
+    (0x9a3004, '088f42b9', 0, False),  # dirty lens / interface refresh
+    (0x99132c, '01102c1e', 1, True),   # visibility cone; original writes s1
+    (0x9a3010, '007f42bd', 2, False),  # projection vertical FOV, lens x24
+    (0x9a3054, '007d42bd', 3, False),  # projection vertical FOV, lens x8
+    (0x9a320c, '88800991', 4, False),  # world -> interface coordinates
+    (0x9a327c, '88800991', 4, False),  # inverse, same viewport contract
+    (0x9e3f84, '683240b9', 5, False),  # flat camera 1 for interface layers
+    (0x9111d8, '60c20591', 6, True),   # HUD block anchors, matrix at original sp+16
+)
+
+
+def aspect_words(start, site, original, event, before):
+    # Private profile entry; all scalar/vector registers and NZCV survive the
+    # C call. A stack-local context allows only declared outputs to change.
+    words = []
+    def emit(w): words.append(w)
+    def here(): return start + 4 * len(words)
+    if not before: emit(int.from_bytes(bytes.fromhex(original), 'little'))
+    emit(SUBI(31, 31, 0x300))
+    for n in range(0, 30, 2): emit(STP(n, n + 1, 31, n * 8))
+    emit(STRX(30, 31, 30)); emit(0xd53b4211); emit(STRX(17, 31, 31))
+    for n in range(32): emit(0x3d800000 | ((16 + n) << 10) | (31 << 5) | n)
+    adr = len(words); emit(0); add = len(words); emit(0)
+    emit(BL(here(), 0xa0e7b0)); missing = len(words); emit(0)
+    emit(0xaa0003f0); emit(ADDI(0, 31, 0)); emit(0x52800001 | event << 5)
+    emit(BLR(16)); restore = here()
+    for n in range(32): emit(0x3dc00000 | ((16 + n) << 10) | (31 << 5) | n)
+    emit(LDRX(17, 31, 31)); emit(0xd51b4211); emit(LDRX(30, 31, 30))
+    for n in range(0, 30, 2): emit(LDP(n, n + 1, 31, n * 8))
+    emit(ADDI(31, 31, 0x300))
+    if before: emit(int.from_bytes(bytes.fromhex(original), 'little'))
+    emit(B(here(), site + 4)); literal = here()
+    data = b'nxnativeAcAspectV1\0'; data += bytes(-len(data) % 4)
+    for off in range(0, len(data), 4): emit(int.from_bytes(data[off:off + 4], 'little'))
+    words[adr] = ADRP(0, start + adr * 4, literal); words[add] = ADDI(0, 0, literal & 0xfff)
+    words[missing] = 0xb4000000 | (((restore - (start + missing * 4)) // 4) << 5)
+    return words
+
+
+STUBS = {'4b159f0f7a360669738390ee8657b4f0': quality_stubs}
+
+# Core: frame-state +4 marks a 30 fps cinematic; +0x24 fixes its step at four
+# 1/120-second ticks. Gameplay takes the host's step (+0x20), or 120 / target before the first
 # present. Game clock +0xd0 is the floating 30 Hz step, +0xd4 retains fractional
 # ticks, +0xd8 publishes whole ticks. Integer consumers therefore advance 30
-# ticks per second at both 30 and 60 fps instead of truncating every half tick.
+# ticks per second at 30, 60 and 120 fps, retaining half and quarter ticks.
 clock = (
     0x350000d5,  # cbnz w21, #0x18
     0x52800031,  # mov w17, #1
     0xb9000611,  # str w17, [x16, #4]
-    0x52800051,  # mov w17, #2
+    0x52800091,  # mov w17, #4 (30 fps in 1/120-second ticks)
     0xb9002611,  # str w17, [x16, #0x24]
     0x1400000a,  # b #0x3c
     0xb900061f,  # str wzr, [x16, #4]
@@ -107,12 +282,12 @@ clock = (
     0xb9402211,  # ldr w17, [x16, #0x20]
     0x350000d1,  # cbnz w17, #0x3c
     0xbd400200,  # ldr s0, [x16]
-    0x1e27d001,  # fmov s1, #30.00000000
-    0x1e212821,  # fadd s1, s1, s1
+    0x52800f11,  # mov w17,#120
+    0x1e230221,  # ucvtf s1,w17
     0x1e201820,  # fdiv s0, s1, s0
     0x1e390011,  # fcvtzu w17, s0
     0x1e230228,  # ucvtf s8, w17
-    0x1e2c1001,  # fmov s1, #0.50000000
+    0x1e2a1001,  # fmov s1, #0.25000000
     0x1e210908,  # fmul s8, s8, s1
     0x34000115,  # cbz w21, #0x68
     0xf9401a08,  # ldr x8, [x16, #0x30]

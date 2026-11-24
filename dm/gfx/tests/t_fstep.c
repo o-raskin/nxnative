@@ -395,6 +395,15 @@ int main(void) {
             check(first_len == want[c] && m.s.k == 2 && m.s.failed == 1, b);
         }
     }
+    {
+        nvn_fstep s = {.per_vsync=2, .smax=6};
+        int step=nvn_fstep_next(&s,4,1,4,4,4,0);
+        check(step==4 && s.k==4, "120-Hz state ABI: a 30 fps cinematic holds four ticks");
+        for(int i=0;i<120;i++) step=nvn_fstep_next(&s,1,.5,1,6,0,0);
+        check(s.k==1 && step>=1 && step<=6, "120-Hz state ABI: cinematic releases back to 120 fps");
+        step=nvn_fstep_next(&s,6,1,4,4,4,0);
+        check(step==4 && s.k==4, "120-Hz state ABI: movie cap re-enters safely after gameplay");
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }
